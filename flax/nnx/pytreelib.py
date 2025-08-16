@@ -137,12 +137,19 @@ def register_data_type(type_: type, /) -> None:
   """
   DATA_REGISTRY.add(type_)
 
+def _leaf_is_data(value: tp.Any, /) -> bool:
+
+  return (
+    graph.is_node_leaf(value)
+    or graph.is_graph_node(value)
+    or type(value) in DATA_REGISTRY
+  )
 
 def is_data_type(value: tp.Any, /) -> bool:
   """Checks if a value is a registered data type.
 
   This function checks a the value is registered data type, which means it is
-  automatically recognized as pytree data when assigned to an Object attribute.
+  automatically recognized as data when assigned a nnx.Pytree attribute.
 
   Data types are:
   - jax.Arrays
@@ -151,24 +158,27 @@ def is_data_type(value: tp.Any, /) -> bool:
   - Variables (Param, BatchStat, RngState, etc.)
   - All graph nodes (Object, Module, Rngs, etc.)
   - Any type registered with `nnx.register_data_type`
+  - Any pytree that contains at least one node or leaf element of the above
 
   Example::
 
-    from flax import nnx
-    import jax.numpy as jnp
-
-    module = nnx.Linear(1, 1, rngs=nnx.Rngs(0))
-    blocks = [module, module, module]
-
-    assert nnx.is_data_type(jnp.array(42))  # Arrays are data
-    assert nnx.is_data_type(nnx.Param(1))   # Variables are data
-    assert nnx.is_data_type(nnx.Rngs(0))    # Objects are data
-    assert nnx.is_data_type(module)         # Objects are data
-
-    assert not nnx.is_data_type(0.)         # float is not data
-    assert not nnx.is_data_type(1)          # int is not data
-    assert not nnx.is_data_type("hello")    # str is not data
-    assert not nnx.is_data_type(blocks)     # list is not data
+    >>> from flax import nnx
+    >>> import jax.numpy as jnp
+    ...
+    >>> module = nnx.Linear(1, 1, rngs=nnx.Rngs(0))
+    >>> blocks = [module, module, module]
+    >>> shape = [32, 16, 512]
+    ...
+    >>> assert nnx.is_data_type(jnp.array(42))  # Arrays are data
+    >>> assert nnx.is_data_type(nnx.Param(1))   # Variables are data
+    >>> assert nnx.is_data_type(nnx.Rngs(0))    # nnx.Pytrees are data
+    >>> assert nnx.is_data_type(module)         # nnx.Modules are data
+    >>> assert nnx.is_data_type(blocks)         # pytrees with data are data
+    ...
+    >>> assert not nnx.is_data_type(0.)         # float is not data
+    >>> assert not nnx.is_data_type(1)          # int is not data
+    >>> assert not nnx.is_data_type("hello")    # str is not data
+    >>> assert not nnx.is_data_type(shape)      # pytrees without data are not data
 
 
   Args:
@@ -176,15 +186,48 @@ def is_data_type(value: tp.Any, /) -> bool:
 
   Returns:
     True if the value is a registered data type, False otherwise.
-
-
   """
 
-  return (
-    graph.is_node_leaf(value)
-    or graph.is_graph_node(value)
-    or type(value) in DATA_REGISTRY
+  is_data = any(
+    _leaf_is_data(leaf)
+    for leaf in jax.tree.leaves(value, is_leaf=_leaf_is_data)
   )
+  return is_data
+
+StaticTag = '__static__'
+Static = tp.Annotated[A, StaticTag]
+Static.__doc__ = """Static marks attributes of a class as static using type annotations.
+Static annotations must be used at the class level and will apply to all instances.
+The usage of Static is recommended when type annotations are used already present
+or required e.g. for dataclasses.
+"""
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class StaticAttr:
+  value: tp.Any
+
+def static(value: A, /) -> A:
+  """Annotates a an attribute as static.
+
+  The return value from `static` must be directly assigned to an Object attribute
+  which will be registered as static attribute.
+
+  Example::
+
+    from flax import nnx
+
+    class Foo(nnx.Pytree):
+      def __init__(self, a, b):
+        self.a = nnx.static(a)  # pytree metadata
+        self.b = nnx.data(b)    # pytree data
+
+    foo = Foo("one", "two")
+
+    assert jax.tree.leaves(foo) == ["two"]
+
+  By default ``nnx.Pytree`` will ...
+  """
+  return StaticAttr(value)  # type: ignore[return-value]
 
 
 def _collect_stats(
@@ -300,13 +343,14 @@ def _graph_node_meta_call(cls: tp.Type[O], *args, **kwargs) -> O:
   vars_obj['_pytree__nodes'] = cls._pytree__nodes
   cls._pytree_meta_construct(node, *args, **kwargs)
   # register possible new data attributes after initialization
+  updates = {}
   for name, value in vars_obj.items():
     if name not in vars_obj['_pytree__nodes']:
-      if any(
-        is_data_type(leaf)
-        for leaf in jax.tree.leaves(value, is_leaf=is_data_type)
-      ):
-        vars_obj['_pytree__nodes'] = vars_obj['_pytree__nodes'].union((name,))
+      if is_data_type(value):
+        updates[name] = True
+
+  if updates:
+    vars_obj['_pytree__nodes'] = vars_obj['_pytree__nodes'].update(updates)
 
   return node
 
@@ -345,7 +389,7 @@ class Pytree(reprlib.Representable, metaclass=PytreeMeta):
   """Base class for all NNX objects."""
 
   if tp.TYPE_CHECKING:
-    _pytree__nodes: frozenset[str]
+    _pytree__nodes: graph.HashableMapping[str, bool]
     _pytree__state: PytreeState
 
   def __init_subclass__(
@@ -363,17 +407,24 @@ class Pytree(reprlib.Representable, metaclass=PytreeMeta):
       init=cls._graph_node_init,  # type: ignore
     )
 
-    parent_nodes: tp.Iterable[str] = getattr(cls, '_pytree__nodes', ())
+    parent_nodes: tp.Mapping[str, bool] = getattr(cls, '_pytree__nodes', {})
 
-    all_nodes: set[str] = set(parent_nodes)
+    all_nodes: dict[str, bool] = dict(parent_nodes)
 
-    all_nodes.add('_pytree__state')
+    all_nodes['_pytree__state'] = True
+    all_nodes['_pytree__nodes'] = False
     # add DataTag attributes
     type_: type
     for name, type_ in cls.__annotations__.items():
-      if type_ != tp.ClassVar and DataTag in getattr(type_, '__metadata__', ()):
-        all_nodes.add(name)
-    cls._pytree__nodes = frozenset(all_nodes)
+      type_metadata = getattr(type_, '__metadata__', ())
+      if type_ == tp.ClassVar:
+        continue
+      elif DataTag in type_metadata:
+        all_nodes[name] = True
+      elif StaticTag in type_metadata:
+        all_nodes[name] = False
+
+    cls._pytree__nodes = graph.HashableMapping(all_nodes)
 
     if pytree:
       jax.tree_util.register_pytree_with_keys(
@@ -389,10 +440,10 @@ class Pytree(reprlib.Representable, metaclass=PytreeMeta):
 
   # Backward compatibility with PR #4863
   @property
-  def _object__nodes(self) -> frozenset[str]:
+  def _object__nodes(self):
     return self._pytree__nodes
   @property
-  def _object__state(self) -> PytreeState:
+  def _object__state(self):
     return self._pytree__state
 
   if not tp.TYPE_CHECKING:
@@ -406,14 +457,22 @@ class Pytree(reprlib.Representable, metaclass=PytreeMeta):
     )
     if type(value) is DataAttr:
       value = value.value
-      if name not in self._pytree__nodes:
-        self._pytree__nodes = self._pytree__nodes.union((name,))
-    # any attribute that contains known data types will be registered as data
-    elif name not in self._pytree__nodes and any(
-      is_data_type(leaf)
-      for leaf in jax.tree.leaves(value, is_leaf=is_data_type)
-    ):
-      self._pytree__nodes = self._pytree__nodes.union((name,))
+      if name in self._pytree__nodes and not self._pytree__nodes[name]:
+        raise ValueError(
+          f"Cannot set '{name}' as data attribute, it is already registered as static."
+        )
+      elif name not in self._pytree__nodes:
+        self._pytree__nodes = self._pytree__nodes.update({name: True})
+    elif type(value) is StaticAttr:
+      value = value.value
+      if name in self._pytree__nodes and self._pytree__nodes[name]:
+        raise ValueError(
+          f"Cannot set '{name}' as static attribute, it is already registered as data."
+        )
+      elif name not in self._pytree__nodes:
+        self._pytree__nodes = self._pytree__nodes.update({name: False})
+    elif name not in self._pytree__nodes and is_data_type(value):
+      self._pytree__nodes = self._pytree__nodes.update({name: True})
     object.__setattr__(self, name, value)
 
   def _check_valid_context(self, error_msg: tp.Callable[[], str]) -> None:
@@ -557,7 +616,7 @@ class Pytree(reprlib.Representable, metaclass=PytreeMeta):
     node_attrs: list[tuple[tp.Any, tp.Any]] = []
     static_attrs: list[tuple[str, tp.Any]] = []
     for name, value in sorted(obj_vars.items()):
-      if name in type_nodes:
+      if name in type_nodes and type_nodes[name]:
         node_names.append(name)
         node_attrs.append((jax.tree_util.GetAttrKey(name), value))
       else:
@@ -572,7 +631,7 @@ class Pytree(reprlib.Representable, metaclass=PytreeMeta):
     node_attrs: list[tp.Any] = []
     static_attrs: list[tuple[str, tp.Any]] = []
     for name, value in sorted(obj_vars.items()):
-      if name in type_nodes:
+      if name in type_nodes and type_nodes[name]:
         node_names.append(name)
         node_attrs.append(value)
       else:

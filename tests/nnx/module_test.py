@@ -70,6 +70,76 @@ class Dict(nnx.Module):
   def __len__(self) -> int:
     return len(vars(self))
 
+class PytreeTest(absltest.TestCase):
+  def test_pytree(self):
+    class Foo(nnx.Pytree):
+      def __init__(self, a, b):
+        self.a = nnx.data(a)
+        self.b = nnx.static(b)
+
+    foo = Foo(a=1, b=2)
+
+    self.assertEqual(jax.tree.leaves(foo), [1])
+
+  def test_consistent_attrs(self):
+    class Foo(nnx.Pytree):
+      def __init__(self, a, b, c):
+        self.a = nnx.data(a)
+        self.b = nnx.static(b)
+        self.c = c
+
+    foo = Foo(a=1, b=2, c=jnp.array(3))
+
+    foo.a = 3 # ok
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Cannot set .* as static attribute",
+    ):
+        foo.a = nnx.static(3)
+
+    foo.b = 4  # ok
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Cannot set .* as data attribute",
+    ):
+        foo.b = nnx.data(4)
+
+    foo.c = jnp.array(5)  # ok
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Cannot set .* as static attribute",
+    ):
+        foo.c = nnx.static(jnp.array(5))
+
+  def test_consistent_attrs_dataclass(self):
+    @dataclasses.dataclass
+    class Foo(nnx.Pytree):
+      a: nnx.Data[int]
+      b: nnx.Static[int]
+      c: jax.Array
+
+    foo = Foo(a=1, b=2, c=jnp.array(3))
+
+    foo.a = 3 # ok
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Cannot set .* as static attribute",
+    ):
+        foo.a = nnx.static(3)
+
+    foo.b = 4  # ok
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Cannot set .* as data attribute",
+    ):
+        foo.b = nnx.data(4)
+
+    foo.c = jnp.array(5)  # ok
+    with self.assertRaisesRegex(
+        ValueError,
+        r"Cannot set .* as static attribute",
+    ):
+        foo.c = nnx.static(jnp.array(5))
 
 class TestModule(absltest.TestCase):
   def test_has_module_state(self):
